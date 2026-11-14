@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -98,6 +99,105 @@ class RatingScore:
     mean_alpha: float
 
 
+# Two-sided 95% Student-t critical values by degrees of freedom; 1.96 past 30.
+_T_95 = (12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+         2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+         2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042)
+
+
+@dataclass
+class Edge:
+    """Every directional call pooled: alpha earned in the direction each one called.
+
+    A hit rate and a mean say nothing about whether they differ from chance, and
+    a sweep of a dozen cells does not. The intervals here say how much the sample
+    supports. Cells whose holding windows overlap for one ticker share return
+    days, so they are not separate observations: the intervals are computed on
+    ``independent``, the cells left when overlapping ones are counted once.
+    """
+
+    count: int
+    independent: int
+    hit_rate: float
+    hit_interval: tuple[float, float]
+    mean_alpha: float
+    alpha_interval: tuple[float, float] | None    # None when there are too few to estimate a spread
+
+    @property
+    def verdict(self) -> str:
+        if self.alpha_interval is None:
+            return "too few independent calls to estimate"
+        low, high = self.alpha_interval
+        if low > 0:
+            return "above zero at the 95% level"
+        if high < 0:
+            return "below zero at the 95% level: the calls were worse than no call"
+        return "not distinguishable from zero"
+
+    def render(self) -> str:
+        line = (
+            f"Directional calls: n={self.count} ({self.independent} with windows that do not overlap), "
+            f"called the direction {self.hit_rate:.0%} "
+            f"(95% interval {self.hit_interval[0]:.0%} to {self.hit_interval[1]:.0%}), "
+            f"mean alpha in the called direction {self.mean_alpha:+.2%}"
+        )
+        if self.alpha_interval is not None:
+            line += f" (95% interval {self.alpha_interval[0]:+.2%} to {self.alpha_interval[1]:+.2%})"
+        return f"{line}: {self.verdict}."
+
+
+def _independent(cells: list[tuple[str, str, int]]) -> int:
+    """How many (ticker, date, holding days) cells have windows that do not overlap.
+
+    Per ticker, a cell counts when it starts after the last counted cell's window
+    has ended, taking a trading day as 7/5 of a calendar day.
+    """
+    count = 0
+    free_from: dict[str, datetime] = {}
+    for ticker, date, holding in sorted(cells):
+        start = datetime.strptime(date, "%Y-%m-%d")
+        if ticker not in free_from or start >= free_from[ticker]:
+            count += 1
+            free_from[ticker] = start + timedelta(days=math.ceil((holding + 1) * 7 / 5))
+    return count
+
+
+def _wilson(hits: float, n: int) -> tuple[float, float]:
+    """95% Wilson interval for a proportion: honest at small n, where p +/- 2se is not."""
+    z = 1.96
+    p = hits / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def _edge(resolved: list[tuple[dict, float]]) -> Edge | None:
+    """The pooled directional edge of settled decisions, or None when none claimed a direction."""
+    signed, cells = [], []
+    for entry, alpha in resolved:
+        direction = _DIRECTION.get(entry["rating"], 0)
+        if not direction:
+            continue
+        signed.append(alpha * direction)
+        holding = entry.get("holding") or ""
+        days = int(holding[:-1]) if holding.endswith("d") and holding[:-1].isdigit() else 5
+        cells.append((entry["ticker"], entry["date"], days))
+    if not signed:
+        return None
+    n, independent = len(signed), _independent(cells)
+    mean = sum(signed) / n
+    hit_rate = sum(a > 0 for a in signed) / n
+    interval = None
+    if independent >= 2 and n >= 2:
+        spread = math.sqrt(sum((a - mean) ** 2 for a in signed) / (n - 1))
+        t = _T_95[independent - 2] if independent - 1 <= len(_T_95) else 1.96
+        half = t * spread / math.sqrt(independent)
+        interval = (mean - half, mean + half)
+    return Edge(count=n, independent=independent, hit_rate=hit_rate,
+                hit_interval=_wilson(hit_rate * independent, independent),
+                mean_alpha=mean, alpha_interval=interval)
+
+
 @dataclass
 class BacktestSummary:
     resolved: int
@@ -105,6 +205,7 @@ class BacktestSummary:
     by_rating: dict[str, RatingScore]
     unscored: int = 0
     holding: str = ""
+    edge: Edge | None = None
 
     def render(self) -> str:
         lines = [f"Resolved cells: {self.resolved} · pending: {self.pending}"
@@ -117,6 +218,8 @@ class BacktestSummary:
                 f"mean alpha {score.mean_alpha:+.2%} vs the benchmark"
             )
         lines.append("")
+        if self.edge is not None:
+            lines.extend([self.edge.render(), ""])
         if self.pending:
             lines.append("Pending cells are not scored above; re-run to settle them.")
         lines.append(
@@ -233,4 +336,5 @@ def summarize(source: BacktestResult | str | Path) -> BacktestSummary:
     return BacktestSummary(resolved=len(resolved),
                            pending=len(entries) - len(resolved) - unscored,
                            by_rating=by_rating, unscored=unscored,
-                           holding=", ".join(sorted(windows)) or "the configured window")
+                           holding=", ".join(sorted(windows)) or "the configured window",
+                           edge=_edge(resolved))

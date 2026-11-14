@@ -364,3 +364,58 @@ def test_a_ticker_or_date_given_twice_runs_and_settles_once(tmp_path):
     graph = _FakeGraph.instances[-1]
     assert graph.calls == [("NVDA", "2026-01-05")]
     assert graph.settled == ["NVDA"]
+
+
+# --- whether the sample supports the figures ---------------------------------
+
+def _edge(tmp_path, rows):
+    return summarize(_log_with(tmp_path, rows)).edge
+
+
+@pytest.mark.unit
+def test_a_handful_of_right_calls_is_not_evidence_of_an_edge(tmp_path):
+    """Three wins out of three reads as 100%; the interval says how little that proves."""
+    edge = _edge(tmp_path, [
+        ("NVDA", "2026-01-05", "**Rating**: Buy\n\nx", (0.05, 0.03)),
+        ("AAPL", "2026-01-05", "**Rating**: Buy\n\nx", (0.01, 0.001)),
+        ("MSFT", "2026-01-05", "**Rating**: Sell\n\nx", (-0.09, -0.08)),
+    ])
+    assert edge.hit_rate == 1.0 and edge.hit_interval[0] < 0.5
+    assert edge.alpha_interval[0] < 0 < edge.alpha_interval[1]
+    assert edge.verdict == "not distinguishable from zero"
+
+
+@pytest.mark.unit
+def test_a_bearish_call_counts_toward_the_edge_in_its_own_direction(tmp_path):
+    edge = _edge(tmp_path, [
+        ("NVDA", "2026-01-05", "**Rating**: Sell\n\nx", (-0.08, -0.05)),
+        ("AAPL", "2026-01-05", "**Rating**: Buy\n\nx", (0.04, 0.03)),
+    ])
+    assert round(edge.mean_alpha, 4) == 0.04 and edge.hit_rate == 1.0
+
+
+@pytest.mark.unit
+def test_overlapping_windows_on_one_ticker_count_once(tmp_path):
+    """Daily cells with a five-day window share four of their five return days."""
+    rows = [("NVDA", f"2026-01-{day:02d}", "**Rating**: Buy\n\nx", (0.02, 0.02)) for day in range(5, 10)]
+    edge = _edge(tmp_path, rows + [("AAPL", "2026-01-05", "**Rating**: Buy\n\nx", (0.02, 0.01))])
+    assert edge.count == 6 and edge.independent == 2
+
+
+@pytest.mark.unit
+def test_a_consistent_edge_over_many_independent_calls_is_reported_as_one(tmp_path):
+    rows = [(f"T{i}", "2026-01-05", "**Rating**: Buy\n\nx", (0.03, 0.02 + (i % 3) / 1000)) for i in range(12)]
+    edge = _edge(tmp_path, rows)
+    assert edge.alpha_interval[0] > 0 and "above zero" in edge.verdict
+
+
+@pytest.mark.unit
+def test_one_call_has_no_interval(tmp_path):
+    edge = _edge(tmp_path, [("NVDA", "2026-01-05", "**Rating**: Buy\n\nx", (0.1, 0.05))])
+    assert edge.alpha_interval is None and "too few" in edge.render()
+
+
+@pytest.mark.unit
+def test_holds_alone_give_no_edge_line(tmp_path):
+    summary = summarize(_log_with(tmp_path, [("NVDA", "2026-01-05", "**Rating**: Hold\n\nx", (0.01, 0.005))]))
+    assert summary.edge is None and "Directional calls" not in summary.render()

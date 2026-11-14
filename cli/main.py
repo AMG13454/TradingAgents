@@ -10,7 +10,10 @@ from cli.models import AnalystType, AssetType
 from cli.prompts import filter_analysts_for_asset_type, parse_analysts
 from cli.run import run_analysis
 from tradingagents.backtest import iter_grid, run_backtest, summarize
+from tradingagents.dataflows.date_window import get_current_date
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.execution import AlpacaPaper, BrokerError, RiskLimits, execute_decision
+from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.llm_clients.openai_client import SIGNED_IN_PROVIDERS
 from tradingagents.portfolio import load_portfolio
 
@@ -158,6 +161,39 @@ def backtest(
         console.print(f"[yellow]failed:[/yellow] {ticker} {date}: {reason}")
     for ticker, reason in result.settlement_failures:
         console.print(f"[yellow]unsettled:[/yellow] {ticker}: {reason}")
+
+
+@app.command("paper-trade")
+def paper_trade(
+    ticker: str = typer.Argument(..., help="US-listed ticker to analyze and trade, e.g. NVDA"),
+    submit: bool = typer.Option(
+        False, "--submit", help="Send the order to the Alpaca paper account; without it the order is only shown"
+    ),
+    analysts: str = typer.Option(
+        None, "--analysts", help="Comma-separated analysts to run: market, sentiment, news, fundamentals; omit for all"
+    ),
+    risk: float = typer.Option(
+        RiskLimits.risk_per_trade, "--risk", help="Share of equity lost if the stop fills at its price, e.g. 0.005"
+    ),
+    max_position: float = typer.Option(
+        RiskLimits.max_position, "--max-position", help="Cap on the position's value as a share of equity"
+    ),
+):
+    """Analyze a ticker today and turn a Buy or Overweight into a paper bracket order."""
+    try:
+        limits = RiskLimits(risk_per_trade=risk, max_position=max_position)
+        chosen = (parse_analysts(analysts, AssetType.STOCK) if analysts
+                  else filter_analysts_for_asset_type(list(AnalystType), AssetType.STOCK))
+        # The keys are checked before the analysis is paid for.
+        broker = AlpacaPaper()
+        graph = TradingAgentsGraph([a.value for a in chosen], config=DEFAULT_CONFIG)
+        final_state, rating = graph.propagate(ticker.strip().upper(), get_current_date())
+        console.print(f"Rating: {escape(str(rating))}")
+        report = execute_decision(final_state, broker, limits, submit=submit)
+    except (ValueError, BrokerError) as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from None
+    console.print(escape(report.render()))
 
 
 # The plans `login` and `logout` take: the providers signed in to, not keyed.

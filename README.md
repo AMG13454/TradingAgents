@@ -107,7 +107,7 @@ The selected analysts work at the same time, each on its own tools, and the rese
 
 ### Risk Management and Portfolio Manager
 - Continuously evaluates portfolio risk by assessing market volatility, liquidity, and other risk factors. The risk management team evaluates and adjusts trading strategies, providing assessment reports to the Portfolio Manager for final decision.
-- The Portfolio Manager approves/rejects the transaction proposal. If approved, the order will be sent to the simulated exchange and executed.
+- The Portfolio Manager approves/rejects the transaction proposal and gives the final rating. The framework itself sends no order; [paper trading](#paper-trading) turns a bullish rating into a bracket order on an Alpaca paper account when you ask for it.
 
 <p align="center">
   <img src="assets/risk.png" width="70%" style="display: inline-block; margin: 0 2%;">
@@ -381,6 +381,36 @@ tradingagents backtest NVDA,AAPL --start 2026-06-01 --end 2026-08-01 --every 7
 ```
 
 Each cell is scored on realized alpha against the instrument's regional benchmark, grouped by rating. A decision is entered at the first close after its date, because a run reads news published after that day's close. Your own memory log is never written to, and re-running the same grid with `run_id=result.run_id` skips the cells that already ran, so an interrupted sweep continues where it stopped.
+
+The summary ends with every directional call pooled: the share that called the direction and the mean alpha earned in the called direction, each with a 95% interval, and a verdict on whether the mean differs from zero. Cells for one ticker whose holding windows overlap share return days, so the intervals count them once; `--every 7` with the default five-day window keeps every cell separate. A sweep with a dozen cells will read "not distinguishable from zero" whatever its hit rate, which is the correct reading of a dozen cells.
+
+## Paper trading
+
+`paper-trade` analyzes a US-listed ticker as of today and turns a Buy or Overweight into a bracket order on an [Alpaca paper account](https://docs.alpaca.markets/docs/paper-trading): a market buy with its stop-loss and take-profit attached, good till cancelled, so the broker holds both exits from the fill onward and they do not depend on your machine staying up.
+
+```bash
+export APCA_API_KEY_ID=...        # paper account keys
+export APCA_API_SECRET_KEY=...
+tradingagents paper-trade NVDA             # shows the order, sends nothing
+tradingagents paper-trade NVDA --submit    # sends it to the paper account
+```
+
+```python
+from tradingagents.execution import AlpacaPaper, RiskLimits, execute_decision
+
+final_state, _ = ta.propagate("NVDA", today)
+report = execute_decision(final_state, AlpacaPaper(), RiskLimits(risk_per_trade=0.005), submit=True)
+print(report.render())
+```
+
+The agents choose the direction; quantity and exits are set by rule from the account the broker reports.
+
+- **Size**: the loss if the stop fills at its price is 0.5% of equity (`--risk`), the position is capped at 10% of equity (`--max-position`) and by buying power, and an Overweight is sized at half a Buy.
+- **Stop**: the Trader's stop when it sits 2% to 20% below the live price, otherwise 8% below.
+- **Take-profit**: the Portfolio Manager's price target when it pays at least what the stop risks, otherwise twice the stop distance.
+- **No order** when the market is closed, the decision is not today's, the symbol is already held or has an open order, or the rating is Hold, Underweight or Sell. The report states which. Reducing or closing a position is left to its bracket exits and to you.
+
+One order is sent per symbol per day however often the command is re-run. Only the paper endpoint is supported: run a backtest, read its interval, and paper trade before considering anything else. A stop order does not guarantee its price; a gap through it loses more than the stated risk.
 
 ## Reproducibility
 
