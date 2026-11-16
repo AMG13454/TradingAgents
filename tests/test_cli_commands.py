@@ -233,3 +233,34 @@ def test_a_failure_message_with_brackets_is_printed_as_text(runner, monkeypatch)
     monkeypatch.setattr(chatgpt_auth, "sign_in", refuse)
     result = runner.invoke(m.app, ["login", "chatgpt"])
     assert result.exit_code == 1 and "[/bogus]" in result.output
+
+
+@pytest.mark.unit
+def test_paper_trade_without_keys_stops_before_paying_for_an_analysis(runner, monkeypatch):
+    monkeypatch.delenv("APCA_API_KEY_ID", raising=False)
+    monkeypatch.delenv("APCA_API_SECRET_KEY", raising=False)
+    monkeypatch.setattr(m, "TradingAgentsGraph", lambda *a, **kw: pytest.fail("the analysis ran"))
+    result = runner.invoke(m.app, ["paper-trade", "NVDA"])
+    assert result.exit_code == 1 and "APCA_API_KEY_ID" in result.output
+
+
+@pytest.mark.unit
+def test_paper_trade_shows_the_order_and_sends_nothing_by_default(runner, monkeypatch):
+    sent = []
+
+    class _Graph:
+        def __init__(self, *a, **kw): pass
+        def propagate(self, ticker, date):
+            return {"company_of_interest": ticker}, "Buy"
+
+    monkeypatch.setattr(m, "AlpacaPaper", lambda: object())
+    monkeypatch.setattr(m, "TradingAgentsGraph", _Graph)
+    monkeypatch.setattr(m, "execute_decision",
+                        lambda state, broker, limits, submit: sent.append(submit) or _Report())
+    result = runner.invoke(m.app, ["paper-trade", "nvda"])
+    assert result.exit_code == 0 and sent == [False] and "planned order" in result.output
+
+
+class _Report:
+    def render(self):
+        return "planned order"
